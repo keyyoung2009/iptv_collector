@@ -1,0 +1,49 @@
+name: Ultimate IPTV Sync
+
+on:
+  schedule:
+    - cron: '0 */3 * * *'  # 每3小时运行
+  workflow_dispatch:
+
+env:
+  TZ: Asia/Shanghai
+  PYTHONUNBUFFERED: 1
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - uses: actions/checkout@v4
+        
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          
+      - name: Install Dependencies
+        run: pip install requests lxml
+        
+      - name: Run System
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python iptv_ultimate.py
+        
+      - name: Upload EPG
+        uses: actions/upload-artifact@v3
+        with:
+          name: epg-data
+          path: |
+            live.*
+            epg.xml
+            report.html
+          
+      - name: Commit Updates
+        run: |
+          git config --global user.name "IPTV Ultimate"
+          git config --global user.email "ultimate@iptv"
+          git add .
+          git commit -m "🌐 AutoUpdate: $(date +'%Y%m%d-%H%M%S')"
+          git push
