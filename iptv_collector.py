@@ -11,7 +11,7 @@ class M3UProcessor:
     def parse(self, content: str) -> List[Dict]:
         return [{
             'name': match.strip(),
-            'category': match‌:ml-citation{ref="1" data="citationList"}.strip(),
+            'category': match.strip(),
             'title': match‌:ml-citation{ref="2" data="citationList"}.strip(),
             'url': match‌:ml-citation{ref="3" data="citationList"}.strip()
         } for match in self.channel_pattern.findall(content)]
