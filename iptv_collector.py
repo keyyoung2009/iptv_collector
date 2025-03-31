@@ -12,7 +12,7 @@ class M3UProcessor:
         return [{
             'name': match.strip(),
             'category': match.strip(),
-            'title': match‌:ml-citation{ref="2" data="citationList"}.strip(),
+            'title': match.strip(),
             'url': match‌:ml-citation{ref="3" data="citationList"}.strip()
         } for match in self.channel_pattern.findall(content)]
 
