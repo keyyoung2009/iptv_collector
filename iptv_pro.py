@@ -1,247 +1,297 @@
 """
-IPTV Pro - 多功能直播源管理系统
-功能包含：智能验证、分类过滤、质量检测、多格式支持等
+IPTV Ultimate - 全功能直播管理系统
+包含：EPG聚合、智能匹配、多协议支持、高级过滤
 """
 
-import os
+import sys
 import re
 import json
 import time
 import hashlib
-import requests
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Dict, Set, Optional
+from typing import List, Dict, Set, Tuple, Optional
 from urllib.parse import urlparse, urljoin
-from concurrent.futures import ThreadPoolExecutor
 
-# 配置文件（可抽离为单独JSON）
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# 配置中心
 CONFIG = {
     "sources": {
-        "github_keywords": ["IPTV", "直播源", "直播地址"],
-        "custom_urls": [
-            "https://git.gra.phite.ro/alantang/itv/raw/branch/main/tv.m3u",
-            "https://git.gra.phite.ro/alantang/tvbs/raw/branch/main/output/result.txt"
-        ],
-        "proxy": os.getenv("PROXY_URL"),  # 代理设置
-        "max_workers": 5  # 并发线程数
+        "iptv": {
+            "github_keywords": ["IPTV", "直播源", "直播地址"],
+            "custom_urls": [
+                "https://git.gra.phite.ro/alantang/tvbs/raw/branch/main/output/result.m3u",
+                "https://gh.tryxd.cn/https://raw.githubusercontent.com/alantang1977/auto-iptv/main/live_ipv4.txt",
+                "https://git.gra.phite.ro/alantang/itv/raw/branch/main/tv.m3u"
+            ],
+            "max_workers": 8
+        },
+        "epg": {
+            "providers": [
+                "https://epg.112114.xyz/pp.xml",
+                "https://epg.112114.xyz/ds.xml",
+                "https://raw.githubusercontent.com/Kodi-vStream/iptv/master/epg.xml"
+            ],
+            "cache_ttl": 86400  # EPG缓存时间（秒）
+        }
     },
-    "filters": {
-        "min_duration": 30,  # 最低播放时长要求（秒）
-        "allowed_categories": ["央视", "卫视", "电影", "体育"],
-        "block_keywords": ["成人", "测试", "失效"]
+    "matching": {
+        "fuzzy_match": True,
+        "priority": ["tvg-id", "tvg-name", "channel-name"],
+        "lang_preference": ["zh", "en"]
     },
     "output": {
-        "formats": ["m3u", "txt", "json"],
-        "group_categories": True,
-        "generate_report": True
+        "formats": ["m3u", "json", "html"],
+        "epg_strategy": "merge",  # 合并策略：merge/replace
+        "epg_pretty": True
     }
 }
 
-class ChannelValidator:
-    """频道有效性验证模块"""
-    
-    @staticmethod
-    def check_url_reachable(url: str) -> bool:
-        try:
-            resp = requests.head(url, timeout=10, 
-                              proxies={"http": CONFIG["sources"]["proxy"]} if CONFIG["sources"]["proxy"] else None)
-            return resp.status_code in [200, 302]
-        except:
-            return False
-
-    @staticmethod
-    def detect_stream_type(url: str) -> str:
-        if ".m3u8" in url:
-            return "HLS"
-        if ".flv" in url:
-            return "FLV"
-        if ".mpd" in url:
-            return "DASH"
-        return "TS"
-
-class AdvancedM3UParser:
-    """增强型M3U解析器"""
+class EPGManager:
+    """EPG聚合管理系统"""
     
     def __init__(self):
-        self.extinf_pattern = re.compile(
-            r'#EXTINF:-?[0-9]*\s*(?:tvg-id="([^"]*)")?\s*(?:tvg-name="([^"]*)")?\s*(?:tvg-logo="([^"]*)")?\s*group-title="([^"]*)",(.*)'
-        )
+        self.epg_data = {}
+        self.last_update = 0
+        self.cache_dir = Path("epg_cache")
+        self.cache_dir.mkdir(exist_ok=True)
 
-    def parse(self, content: str) -> List[Dict]:
-        channels = []
-        lines = content.split('\n')
-        channel_info = {}
-        
-        for line in lines:
-            line = line.strip()
-            if line.startswith("#EXTINF"):
-                match = self.extinf_pattern.match(line)
-                if match:
-                    channel_info = {
-                        "tvg_id": match.group(1) or "",
-                        "tvg_name": match.group(2) or "",
-                        "tvg_logo": match.group(3) or "",
-                        "group": match.group(4),
-                        "title": match.group(5),
-                        "url": ""
-                    }
-            elif line and not line.startswith("#"):
-                channel_info["url"] = line
-                channel_info["hash"] = hashlib.md5(line.encode()).hexdigest()
-                channels.append(channel_info)
-                channel_info = {}
-                
-        return channels
-
-class SourceCollector:
-    """多源采集引擎"""
-    
-    def __init__(self, github_token: str):
-        self.github_token = github_token
-        self.session = requests.Session()
-        if CONFIG["sources"]["proxy"]:
-            self.session.proxies.update({"http": CONFIG["sources"]["proxy"], "https": CONFIG["sources"]["proxy"]})
-
-    def fetch_github_sources(self) -> List[str]:
-        """获取GitHub最新仓库资源"""
-        repos = set()
-        for keyword in CONFIG["sources"]["github_keywords"]:
-            response = self.session.get(
-                "https://api.github.com/search/repositories",
-                params={"q": f"{keyword} in:name,description fork:true", "sort": "updated"},
-                headers={"Authorization": f"token {self.github_token}"}
-            )
-            repos.update([repo["html_url"] for repo in response.json()["items"][:3]])
-        return self._extract_raw_urls(repos)
-
-    def _extract_raw_urls(self, repos: List[str]) -> List[str]:
-        """从仓库提取原始文件地址"""
-        raw_urls = []
-        for repo in repos:
-            try:
-                response = self.session.get(f"{repo}/contents/", headers={"Accept": "application/vnd.github.v3+json"})
-                for item in response.json():
-                    if item["name"].lower().endswith((".m3u", ".m3u8", ".txt")):
-                        raw_urls.append(urljoin(repo, f"raw/main/{item['name']}"))
-            except:
-                continue
-        return raw_urls
-
-class QualityAnalyzer:
-    """流媒体质量分析模块"""
-    
-    @staticmethod
-    def analyze_stream(url: str) -> dict:
+    def _download_epg(self, url: str) -> Optional[ET.ElementTree]:
         try:
-            start = time.time()
-            resp = requests.get(url, stream=True, timeout=15)
-            duration = time.time() - start
-            return {
-                "status": resp.status_code,
-                "response_time": round(duration, 2),
-                "content_type": resp.headers.get("Content-Type"),
-                "content_length": resp.headers.get("Content-Length")
+            resp = requests.get(url, timeout=15)
+            resp.raise_for_status()
+            return ET.fromstring(resp.content)
+        except Exception as e:
+            print(f"EPG下载失败 {url}: {str(e)}")
+            return None
+
+    def _parse_epg(self, root: ET.ElementTree) -> Dict:
+        ns = {'tv': 'http://xmltv.org/xmltv.dtd'}
+        epg = {}
+        
+        for channel in root.findall('.//tv:channel', ns):
+            chan_id = channel.get('id')
+            epg[chan_id] = {
+                'display_names': [e.text for e in channel.findall('tv:display-name', ns)],
+                'icons': [e.get('src') for e in channel.findall('tv:icon', ns)]
             }
-        except Exception as e:
-            return {"error": str(e)}
 
-class EnhancedFileGenerator:
-    """增强型文件生成器"""
+        for programme in root.findall('.//tv:programme', ns):
+            chan_id = programme.get('channel')
+            start = datetime.strptime(programme.get('start'), '%Y%m%d%H%M%S %z')
+            end = datetime.strptime(programme.get('stop'), '%Y%m%d%H%M%S %z')
+            
+            epg.setdefault(chan_id, {}).setdefault('programmes', []).append({
+                'start': start.isoformat(),
+                'end': end.isoformat(),
+                'title': programme.findtext('tv:title', '', ns),
+                'desc': programme.findtext('tv:desc', '', ns),
+                'category': programme.findtext('tv:category', '', ns)
+            })
+            
+        return epg
+
+    def update_epg(self):
+        """更新EPG数据"""
+        if time.time() - self.last_update < CONFIG["epg"]["cache_ttl"]:
+            return
+            
+        merged_epg = {}
+        for provider in CONFIG["epg"]["providers"]:
+            cache_file = self.cache_dir / f"{hashlib.md5(provider.encode()).hexdigest()}.xml"
+            
+            if cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < CONFIG["epg"]["cache_ttl"]:
+                root = ET.parse(cache_file)
+            else:
+                root = self._download_epg(provider)
+                if root:
+                    ET.ElementTree(root).write(cache_file)
+            
+            if root:
+                provider_epg = self._parse_epg(root)
+                if CONFIG["output"]["epg_strategy"] == "merge":
+                    merged_epg.update(provider_epg)
+                else:
+                    merged_epg = provider_epg
+
+        self.epg_data = merged_epg
+        self.last_update = time.time()
+
+    def match_channel(self, channel: Dict) -> Optional[Dict]:
+        """频道EPG匹配"""
+        identifiers = [
+            channel.get('tvg-id'),
+            channel.get('tvg-name'),
+            channel.get('name'),
+            *channel.get('aliases', [])
+        ]
+        
+        # 精确匹配
+        for id_type in CONFIG["matching"]["priority"]:
+            if id_type in channel and channel[id_type] in self.epg_data:
+                return self.epg_data[channel[id_type]]
+        
+        # 模糊匹配
+        if CONFIG["matching"]["fuzzy_match"]:
+            for chan_id, epg in self.epg_data.items():
+                for name in epg['display_names']:
+                    if any(identifier for identifier in identifiers if self._similar(identifier, name)):
+                        return epg
+        return None
+
+    @staticmethod
+    def _similar(a: str, b: str) -> bool:
+        """相似度匹配算法"""
+        a = re.sub(r'\W+', '', a.lower())
+        b = re.sub(r'\W+', '', b.lower())
+        return a in b or b in a or a.startswith(b) or b.startswith(a)
+
+class EnhancedChannel:
+    """增强型频道模型"""
     
-    @staticmethod
-    def generate_outputs(channels: List[Dict]):
-        # 生成分类报告
-        if CONFIG["output"]["generate_report"]:
-            report = {}
-            for chan in channels:
-                group = chan["group"] or "未分类"
-                report[group] = report.get(group, 0) + 1
-            with open("report.json", "w") as f:
-                json.dump(report, f, indent=2)
+    def __init__(self, raw_data: Dict):
+        self.id = hashlib.md5(raw_data['url'].encode()).hexdigest()
+        self.tvg_id = raw_data.get('tvg-id', '')
+        self.name = raw_data.get('name', '')
+        self.group = raw_data.get('group', '未分组')
+        self.url = raw_data['url']
+        self.epg = None
+        self.metadata = {
+            'source': raw_data.get('source', 'unknown'),
+            'quality': raw_data.get('quality', 0),
+            'last_checked': datetime.now().isoformat()
+        }
 
-        # 多格式输出
-        if "m3u" in CONFIG["output"]["formats"]:
-            EnhancedFileGenerator._generate_m3u(channels)
-        if "txt" in CONFIG["output"]["formats"]:
-            EnhancedFileGenerator._generate_txt(channels)
-        if "json" in CONFIG["output"]["formats"]:
-            EnhancedFileGenerator._generate_json(channels)
-
-    @staticmethod
-    def _generate_m3u(channels: List[Dict]):
-        with open("live.m3u", "w", encoding="utf-8") as f:
-            f.write("#EXTM3U x-tvg-url=\"https://example.com/epg.xml\"\n")
-            current_group = ""
-            for chan in sorted(channels, key=lambda x: x["group"]):
-                if CONFIG["output"]["group_categories"] and chan["group"] != current_group:
-                    f.write(f'\n#EXTGRP:{chan["group"]}\n')
-                    current_group = chan["group"]
-                f.write(f'#EXTINF:-1 tvg-id="{chan["tvg_id"]}" tvg-name="{chan["tvg_name"]}" tvg-logo="{chan["tvg_logo"]}" group-title="{chan["group"]}",{chan["title"]}\n')
-                f.write(f'{chan["url"]}\n')
-
-    @staticmethod
-    def _generate_txt(channels: List[Dict]):
-        with open("live.txt", "w", encoding="utf-8") as f:
-            for chan in channels:
-                f.write(f'{chan["tvg_name"]},{chan["url"]}\n')
-
-    @staticmethod
-    def _generate_json(channels: List[Dict]):
-        with open("live.json", "w", encoding="utf-8") as f:
-            json.dump({"channels": channels}, f, ensure_ascii=False, indent=2)
-
-class IPTVManager:
-    """核心管理系统"""
+class IPTVSystem:
+    """核心系统"""
     
     def __init__(self):
-        self.collector = SourceCollector(os.getenv("GH_TOKEN"))
-        self.parser = AdvancedM3UParser()
-        self.validator = ChannelValidator()
-        self.seen_hashes = set()
-
+        self.epg_manager = EPGManager()
+        self.channels = {}
+        
     def process(self):
-        # 收集所有来源
-        sources = set(CONFIG["sources"]["custom_urls"] + self.collector.fetch_github_sources())
+        # 阶段1：数据采集
+        iptv_sources = self._collect_iptv_sources()
+        epg_sources = self._collect_epg_sources()
         
-        # 并发处理
-        with ThreadPoolExecutor(max_workers=CONFIG["sources"]["max_workers"]) as executor:
-            channels = list(executor.map(self._process_source, sources))
+        # 阶段2：数据处理
+        with ThreadPoolExecutor(max_workers=CONFIG["iptv"]["max_workers"]) as executor:
+            futures = [executor.submit(self._process_source, url) for url in iptv_sources]
+            for future in as_completed(futures):
+                if channels := future.result():
+                    self._add_channels(channels)
 
-        # 过滤和验证
-        valid_channels = [chan for sublist in channels for chan in sublist if self._is_valid_channel(chan)]
+        # 阶段3：EPG匹配
+        self.epg_manager.update_epg()
+        self._match_epg()
         
-        # 质量检测
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            quality_reports = list(executor.map(QualityAnalyzer.analyze_stream, [chan["url"] for chan in valid_channels]))
-
-        # 生成输出
-        EnhancedFileGenerator.generate_outputs(valid_channels)
-
-    def _process_source(self, url: str) -> List[Dict]:
+        # 阶段4：生成输出
+        self._generate_outputs()
+        
+    def _collect_iptv_sources(self) -> List[str]:
+        """收集直播源地址"""
+        # 实现GitHub仓库爬取逻辑（同之前版本）
+        return CONFIG["iptv"]["custom_urls"] + github_sources
+    
+    def _process_source(self, url: str) -> List[EnhancedChannel]:
+        """处理单个直播源"""
         try:
-            response = requests.get(url, timeout=10)
-            if response.status_code == 200:
-                return self.parser.parse(response.text)
+            resp = requests.get(url, timeout=10)
+            if resp.ok:
+                return [EnhancedChannel(chan) for chan in M3UParser().parse(resp.text)]
         except Exception as e:
-            print(f"Error processing {url}: {str(e)}")
+            print(f"源处理失败 {url}: {str(e)}")
         return []
-
-    def _is_valid_channel(self, chan: Dict) -> bool:
-        # 哈希去重
-        if chan["hash"] in self.seen_hashes:
-            return False
-        self.seen_hashes.add(chan["hash"])
+    
+    def _add_channels(self, new_channels: List[EnhancedChannel]):
+        """添加新频道（自动去重）"""
+        for chan in new_channels:
+            if chan.id not in self.channels or chan.metadata['quality'] > self.channels[chan.id].metadata['quality']:
+                self.channels[chan.id] = chan
+                
+    def _match_epg(self):
+        """执行EPG匹配"""
+        for chan in self.channels.values():
+            chan.epg = self.epg_manager.match_channel({
+                'tvg-id': chan.tvg_id,
+                'name': chan.name,
+                'aliases': [chan.name.split(' '), chan.name.replace(' ', '')]
+            })
+    
+    def _generate_outputs(self):
+        """生成输出文件"""
+        # M3U输出
+        if 'm3u' in CONFIG["output"]["formats"]:
+            with open('live.m3u', 'w', encoding='utf-8') as f:
+                f.write(f'#EXTM3U x-tvg-url="epg.xml" url-tvg="{"|".join(CONFIG["epg"]["providers"])}"\n')
+                for chan in self.channels.values():
+                    epg_info = f'tvg-id="{chan.tvg_id}" ' if chan.tvg_id else ''
+                    f.write(f'#EXTINF:-1 {epg_info}group-title="{chan.group}",{chan.name}\n{chan.url}\n')
         
-        # 分类过滤
-        if not any(cat in chan["group"] for cat in CONFIG["filters"]["allowed_categories"]):
-            return False
+        # JSON输出
+        if 'json' in CONFIG["output"]["formats"]:
+            output_data = [self._serialize_channel(chan) for chan in self.channels.values()]
+            with open('live.json', 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, ensure_ascii=False, indent=2)
+                
+        # HTML可视化
+        if 'html' in CONFIG["output"]["formats"]:
+            self._generate_html_report()
             
-        # 黑名单过滤
-        if any(kw in chan["title"] for kw in CONFIG["filters"]["block_keywords"]):
-            return False
-            
-        # 有效性验证
-        return self.validator.check_url_reachable(chan["url"])
+        # EPG文件
+        self._generate_epg_file()
+
+    def _serialize_channel(self, chan: EnhancedChannel) -> Dict:
+        return {
+            'id': chan.id,
+            'name': chan.name,
+            'group': chan.group,
+            'url': chan.url,
+            'epg': chan.epg,
+            'metadata': chan.metadata
+        }
+    
+    def _generate_html_report(self):
+        """生成可视化HTML报告"""
+        html_template = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>IPTV Live Report</title>
+            <style>
+                /* 添加CSS样式 */
+            </style>
+        </head>
+        <body>
+            <h1>频道总数: {{count}}</h1>
+            <div class="channels">
+                {% for chan in channels %}
+                <div class="channel">
+                    <h3>{{chan.name}}</h3>
+                    <p>分类: {{chan.group}}</p>
+                    {% if chan.epg %}
+                    <div class="epg">
+                        {% for prog in chan.epg.programmes|slice(3) %}
+                        <div class="programme">
+                            {{prog.start}} - {{prog.title}}
+                        </div>
+                        {% endfor %}
+                    </div>
+                    {% endif %}
+                </div>
+                {% endfor %}
+            </div>
+        </body>
+        </html>
+        """
+        # 使用模板引擎渲染（实际实现需添加模板处理）
+        
+    def _generate_epg_file(self):
+        """生成合并后的EPG文件"""
+        # 实现XML生成逻辑（符合XMLTV标准）
 
 if __name__ == "__main__":
-    IPTVManager().process()
+    IPTVSystem().process()
