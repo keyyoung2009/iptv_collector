@@ -19,8 +19,8 @@ CONFIG = {
     "sources": {
         "github_keywords": ["IPTV", "直播源", "直播地址"],
         "custom_urls": [
-            "https://raw.githubusercontent.com/iptv-org/iptv/master/index.m3u",
-            "https://mirror.ghproxy.com/https://raw.githubusercontent.com/zhanghong1983/IPTV/main/IPTV.m3u"
+            "https://git.gra.phite.ro/alantang/itv/raw/branch/main/tv.m3u",
+            "https://git.gra.phite.ro/alantang/tvbs/raw/branch/main/output/result.txt"
         ],
         "proxy": os.getenv("PROXY_URL"),  # 代理设置
         "max_workers": 5  # 并发线程数
